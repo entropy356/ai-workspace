@@ -1,0 +1,460 @@
+ghpat 规格文档
+版本：v0.0.1
+目标平台：Linux x86_64（无 root 用户态），静态链接 musl 单二进制
+运行形态：常驻守护进程 + 客户端 + 凭据助手，同一二进制分叉
+
+（说明：本文件为纯规格正文。解释性内容见 explain.txt，未来规划见 roadmap.txt。）
+（章节号沿用原规格文档编号，以便交叉引用。）
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. 概述
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ghpat 是一个面向 AI 智能体的 GitHub PAT 内存代理。它在进程内生成 age 密钥对（私钥永不落盘），接收外部用公钥加密的 token.enc，解密后仅驻留于受保护内存，向本用户提供近似 gh 与 git 的操作体验。进程退出即销毁私钥与 PAT，全程无磁盘持久化。
+
+ghpat 不负责加密。token 持有者（人类）自行使用 age CLI 以 ghpat 打印的公钥加密 PAT，将密文交给 ghpat。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. 术语与缩写
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+术语      含义
+PAT     GitHub Personal Access Token（Classic ghp_ 或 Fine-grained github_pat_）
+age     Filippo Valsorta 设计的文件加密格式；X25519 + ChaCha20-Poly1305
+daemon  ghpat 的常驻进程形态，持有私钥与 PAT
+client  ghpat 的命令形态，通过 Unix socket 与 daemon 通信
+cred-helper     ghpat 的第三形态：作为 git credential helper 被 git 子进程调用（显式子命令 ghpat cred-helper）
+wrap 模式 client fork 子进程并通过 GIT_CONFIG_COUNT 注入临时 git 配置的执行方式
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. 设计目标与边界
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3.1 目标
+• PAT 与 age 私钥仅存在于 daemon 内存：不落盘、不出现在任何进程的 argv、不进入 daemon 自身环境变量。
+• 进程退出（正常退出、信号、崩溃）后，敏感数据不可恢复。
+• 使用体验：ghpat <gh子命令> ≈ gh；ghpat wrap -- git ... ≈ 原生 git（凭据自动注入）。
+• 无 root、无 systemd 依赖、单二进制。
+• 更换 PAT = 再次传入新的 token.enc；更换失败不影响当前会话。
+
+3.2 非目标
+• 不支持 SSH remote（仅 HTTPS remote 认证）。
+• 不实现 gh 全命令集；v0.0.1 覆盖 §7.3 所列子命令，其余经 ghpat api 透传。
+• 不管理多个 PAT。
+• 不加密 token（加密由持有者用 age 完成）。
+• v0.0.x 不防御同 UID 进程主动调用 ghpat cred-helper 窃取 PAT（见 §3.3）。
+
+3.3 威胁模型
+攻击面     是否防御    手段
+磁盘取证（swap、core dump、临时文件、~/.git-credentials）    是       单页 mmap + mlock + MADV_DONTDUMP + prctl(PR_SET_DUMPABLE, 0)
+同 UID 进程读取 daemon 内存（ptrace、/proc/<pid>/mem）    是       PR_SET_DUMPABLE=0 后，无 CAP_SYS_PTRACE 的同 UID 进程无法附加
+同 UID 进程通过 ps//proc/<pid>/environ/argv 扫描到 PAT  是       PAT 不进入任何进程的 environ 或 argv（含 git 子进程）
+同 UID 恶意进程 / 被 Prompt Injection 的 AI Agent 主动调用 ghpat cred-helper 骗取 PAT        否（v0.0.x 明示不防御） 缓解方案（一次性 ticket、--gh-only 模式）列为 v0.1+ 待办（见 roadmap.txt）
+同 UID 进程直接连接 socket 调用 gh / set_token / shutdown        部分      socket 0600 + SO_PEERCRED 同 UID 校验——同 UID 本无法完全拒绝
+网络窃听    是       仅出站 HTTPS（rustls，忽略系统证书注入环境变量）
+daemon 崩溃后内存残留  部分      页内 zeroize + mlock（内核级页回收时机不受控）
+恶意/损坏 token.enc 是       解密失败拒绝且不影响现有状态；解密成功后经 /user 验证
+
+明确不在威胁模型内：root 攻击者、内核级攻击、冷启动攻击、同 UID 主动窃取 PAT（上表第 4 行）。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. 架构
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+┌──────────────────────────── 用户态 ────────────────────────────┐
+│                                                                 │
+│  ghpat start / set-token / stop / status                        │
+│  ghpat pr list / api ...          ghpat wrap -- git push        │
+│        │ client                          │ fork + env 注入      │
+│        ▼                                 ▼                      │
+│  ┌──────────────────────────────────────────────────┐           │
+│  │              ghpat daemon（常驻）                 │           │
+│  │                                                   │           │
+│  │  SensitivePage (单页 mmap, mlock, MADV_DONTDUMP)  │           │
+│  │   ├─ identity: [u8; 32]        (age 私钥)         │           │
+│  │   └─ pat: PatBuffer{len, [u8;256]}               │           │
+│  │                                                   │           │
+│  │  公钥打印（启动时经管道传给父进程）    reqwest API  │           │
+│  │                                                   │           │
+│  │  Unix socket: ${XDG_RUNTIME_DIR:-/tmp/ghpat-$UID} │           │
+│  │              /ghpat.sock (umask 0o077 → 0600)     │           │
+│  └───────────────────────┬───────────────────────────┘           │
+│                          │                                       │
+│                          ▼                                       │
+│           ghpat cred-helper（git 子进程内）                      │
+│           argv[1]="get"，stdin 读 credential 协议，              │
+│           经 socket 向 daemon 取 PAT，                           │
+│           stdout 输出 username/password                          │
+│                          │                                       │
+│                          ▼                                       │
+│                    git 子进程完成 HTTPS 认证                     │
+└─────────────────────────────────────────────────────────────────┘
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4.1 单二进制三形态
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+二进制启动时按 argv 分叉，不使用任何环境变量做形态判断：
+• argv[1] == "cred-helper" → cred-helper 模式：执行 §7.5 的 git credential helper 协议，从 daemon 取 PAT 后退出。
+• argv[1] == "--daemon-internal" → daemon 模式（仅由 ghpat start 派生的子进程使用，stdin/stdout 为与父进程通信的匿名管道）。
+• 其余（start、set-token、stop、status、pubkey、wrap、api、pr 等）→ client 模式。
+
+环境变量 GHPAT_CRED_HELPER 废弃；GHPAT_SOCK 仅用于传递 socket 路径（非敏感），且在 wrap 注入的子进程中被显式保留以便 cred-helper 定位 daemon。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. 状态与生命周期
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5.1 Vault（daemon 内唯一敏感状态）
+/// daemon 启动时通过 mmap(MAP_PRIVATE|MAP_ANONYMOUS) 分配一页 (4096B)，
+/// 整页 mlock + madvise(MADV_DONTDUMP)，进程生命周期内不 munlock、不 realloc。
+/// identity 与 pat 原地存放在该页内，更换 token 时原地覆写。
+struct SensitivePage {
+    page: *mut u8,                          // mmap 基址，页对齐
+    // 布局：
+    //   offset 0..32   : identity (age x25519 私钥, 32B)
+    //   offset 32..40  : pat_len (u64 LE)
+    //   offset 40..296 : pat_buf ([u8; 256])
+    //   offset 296..   : 预留（保持页内零填充）
+}
+impl SensitivePage {
+    fn new() -> io::Result<Self>;
+    fn set_pat(&mut self, pat: &str);       // 原地 zeroize 旧值后覆写
+    fn pat(&self) -> Option<&str>;          // 以引用暴露，禁止克隆到页外
+    fn zeroize_all(&mut self);              // volatile 写零整页
+}
+
+规则：daemon 自身业务代码严禁将 PAT 复制到 SensitivePage 之外的任何缓冲。
+
+5.2 生命周期状态机
+[启动] ──生成密钥对──> [READY（无token）]
+                          │ set-token token.enc
+                          ▼
+                     [解密+验证新token]
+                          │
+              ┌───────────┴───────────┐
+              │ 失败                  │ 成功
+              ▼                       ▼
+     【保持原状态不变】         [ARMED（持有新token）]
+   （READY则仍READY；        （旧PAT若存在已原地zeroize）
+    ARMED则仍ARMED，
+    旧有效PAT不动）
+              │ stop / SIGINT / SIGTERM / panic
+              ▼
+         [销毁：zeroize 整页，unlink socket，exit]
+
+5.3 启动流程
+ghpat start（client 模式）执行流程：
+1. 计算 socket 路径：${GHPAT_SOCK:-${XDG_RUNTIME_DIR:-/tmp/ghpat-$UID}/ghpat.sock}。
+   • 若回退到 /tmp 路径：校验父目录 /tmp/ghpat-$UID 存在且归属当前 UID、权限 0700；不满足则尝试 mkdir(0700)，失败即报错退出。
+2. 若 socket 文件存在：尝试连接；可连接 → 报错 DAEMON_ALREADY_RUNNING 退出；不可连接（残留）→ unlink 后继续。
+3. 创建匿名管道（pipe2(O_CLOEXEC)），fork() 派生子进程 ghpat --daemon-internal（通过 std::process::Command 重新 exec 自身，继承管道写端）。父进程随即关闭写端、阻塞读。
+4. 子进程（daemon）依次执行：
+   a. umask(0o077)，随后 bind() Unix socket（umask 保证创建即 0600，消除 bind→chmod TOCTOU）。
+   b. 初始化 Tokio rt-multi-thread 运行时。
+   c. prctl(PR_SET_DUMPABLE, 0)。
+   d. 分配 SensitivePage（mmap + mlock + MADV_DONTDUMP），生成 age::x25519::Identity。
+   e. listen() socket。
+   f. 经管道向父进程写入一行就绪消息：OK <age公钥>\n，关闭管道。
+   g. 进入事件循环。
+5. 父进程：读到 OK <公钥> → 打印公钥与状态到 stdout，exit(0)；读到 ERR <原因> 或管道 EOF（子进程崩溃）→ 打印错误，exit(1)；等待超时 5s 视为启动失败。
+
+$ ghpat start
+age1qpz3e2x8v9y0z7w6q5r4t3s2u1i0o9p8o7n6m5l4k3j2h1g
+daemon 已启动 (pid 12345, socket: /run/user/1000/ghpat.sock)
+状态: READY（等待 token 注入）
+
+后台日志重定向到 ${socket父目录}/ghpat.log（0600，仅错误与状态变更，超 1MB 截断，见 §7.2）。
+
+5.4 退出流程
+正常退出（ghpat stop 或信号）：
+1. 收到信号 / shutdown 请求后：SensitivePage::zeroize_all()（volatile 写零整页，保留 mlock 状态直至进程退出）。
+2. unlink(socket_path)。
+3. std::process::exit(0)。
+
+异常退出（panic）：panic=unwind 下 Drop 执行 zeroize；若运行时 abort，依赖 MADV_DONTDUMP 与进程终止后的内核页回收。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. IPC 协议
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6.1 传输层
+• Unix domain socket 路径：${GHPAT_SOCK:-${XDG_RUNTIME_DIR:-/tmp/ghpat-$UID}/ghpat.sock}。
+• 回退到 /tmp 时父目录 /tmp/ghpat-$UID 归属当前 UID 且 0700。
+• daemon 启动时 umask(0o077) 后 bind，socket 权限即 0600，无 bind→chmod 时间窗。
+• 帧格式：JSON Lines（每行一个 JSON 对象，UTF-8，\n 分隔），一问一答，同连接可多轮。
+
+6.2 消息定义
+// Request
+{
+  "id": 1,
+  "cmd": "set_token" | "get_pat" | "gh" | "status" | "shutdown",
+  // cmd=set_token
+  "enc_b64": "<base64 of token.enc 字节>",
+  // cmd=gh
+  "args": ["pr", "list", "--state", "open"],
+  "repo": "owner/name",              // 可选，client 侧已解析
+  // cmd=get_pat（仅 cred-helper 使用）
+  "host": "github.com",
+  "protocol": "https"
+}
+// Response
+{
+  "id": 1,
+  "ok": true,
+  "payload": { ... }
+}
+// 或
+{
+  "id": 1,
+  "ok": false,
+  "error": { "code": "NO_TOKEN", "message": "PAT 未注入" }
+}
+
+6.3 命令语义
+cmd     请求额外字段  响应 payload      说明
+status  —       {"state":"ready|armed","fingerprint":"ghp_…9xYz"}      不返回敏感数据
+set_token       enc_b64 {"login":"octocat","scopes":["repo"],"fingerprint":"ghp_…9xYz"} 失败保留原状态（§5.2）
+get_pat host, protocol  {"username":"x-access-token","password":"<PAT>"}        仅供 cred-helper；host 限定 github.com 域
+gh      args, repo      {"stdout":"...","stderr":"...","exit_code":0}   daemon 内执行 gh 子命令
+shutdown        —       {"ok":true}     触发 §5.4
+
+6.4 并发与锁定
+• daemon 侧对 SensitivePage 使用 Arc<Mutex<...>>（页内原地覆写不允许并发读者与写者交错）：gh/status/get_pat 短暂持锁取引用后即释放；set_token/shutdown 持锁完成原子替换。
+• 业务代码对 PAT 仅以 &str 引用使用，不构造 String 副本。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. CLI 规格
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7.1 全局参数
+ghpat [全局选项] <子命令> [子命令参数]
+全局选项：
+  --sock <PATH>    覆盖 socket 路径
+  --verbose        client 侧打印 IPC 原始帧（get_pat 响应脱敏为 ***）
+
+7.2 生命周期命令
+ghpat start [--foreground]
+见 §5.3。--foreground 时当前进程直接进入 daemon 模式（跳过 fork，公钥直接打印至 stdout）。
+
+ghpat set-token <token.enc | ->
+• 读取文件（或 - 读 stdin）字节，base64 后经 IPC set_token 发送。
+• daemon 侧流程：
+  1. age::Decryptor::new(bytes)，仅接受 Recipients 变体（拒绝 passphrase 加密）。
+  2. 以页内 identity 解密 → PAT 明文（写入页前临时缓冲，写入后立即 zeroize 该缓冲）。
+  3. GET /user 验证：200 → 记录 login；401 → 拒绝，不影响现有状态。
+  4. 验证通过后：原地 zeroize 旧 PAT（若有）→ 写入新 PAT → 记录指纹。
+• Fingerprint 格式：识别已知前缀（ghp_ / github_pat_ / gho_ / ghs_ / ghu_），显示为 <prefix>…<末4位>（如 ghp_…9xYz、github_pat_…9xYz）。无法识别前缀时显示 <前8字符>…<末4位>。
+• Scopes 处理：Classic PAT 从 X-OAuth-Scopes 头读取；Fine-grained PAT（github_pat_ 前缀）请求 /user 不返回该头，此时显示 scopes: fine-grained，不视为异常。
+
+$ ghpat set-token token.enc
+✔ 解密成功
+✔ 验证通过: octocat (scopes: fine-grained)
+✔ fingerprint: github_pat_…9xYz
+状态: ARMED
+$ ghpat set-token broken.enc
+✘ 解密失败：密文与公钥不匹配或已损坏
+（当前状态保持不变: ARMED, ghp_…9xYz）
+
+ghpat status / ghpat stop / ghpat pubkey
+status 显示运行状态与指纹；stop 触发 §5.4；pubkey 请求当前公钥（identity 保留派生公钥能力）。
+日志：daemon 仅记录错误与状态变更至 ghpat.log；文件超过 1MB 时截断保留后半（$XDG_RUNTIME_DIR 为 tmpfs，须防膨胀）。
+
+7.3 gh 子命令
+统一入口：ghpat <sub> [args...] → IPC gh → daemon 调用 GitHub REST API。
+
+v0.0.1 必须实现：
+命令      API     行为
+ghpat api <endpoint> [--method M] [--field k=v]...      任意 REST 透传      JSON pretty-print，--jq 支持
+ghpat repo view [<repo>] / repo list [--limit N]        GET /repos/{repo} / GET /user/repos     表格输出
+ghpat pr list [--state open]    GET /repos/{repo}/pulls 表格输出（见下方字段口径）
+ghpat pr view <num> / create / merge    对应 REST 同风格
+ghpat issue list / view / create        对应 REST 同风格
+ghpat auth status       GET /user       显示 login/scopes/fingerprint
+
+仓库解析：--repo > GH_REPO env > client 在本地解析 cwd 的 git remote get-url origin 后随请求发送 repo 字段。
+分页：默认 30 条，--limit 至 100，超出自动翻页。
+
+输出格式与字段口径：
+• 表格输出：列定义对齐 gh（NUMBER、TITLE、BRANCH、STATE 等），此为验收基准（§11.3）。
+• --json <fields>：v0.0.1 直接映射 REST API 原生字段（核心字段集：number,title,state,headRefName,baseRefName,url,author,createdAt,isDraft）。
+• --jq <expr>：依赖 jaq（完整 crate 集见 §10）。
+
+7.4 ghpat wrap -- <command> [args...]
+• 语法糖：fork 子进程执行 <command>，环境注入：
+  GIT_CONFIG_COUNT=1
+  GIT_CONFIG_KEY_0="credential.https://github.com.helper"
+  GIT_CONFIG_VALUE_0="!/abs/path/to/ghpat cred-helper"
+  GIT_TERMINAL_PROMPT=0
+  GHPAT_SOCK=<当前sock路径>          # 非敏感，供 cred-helper 定位 daemon
+• stdin/stdout/stderr 直通子进程，退出码透传。
+• 典型用法：ghpat wrap -- git push origin main、ghpat wrap -- git clone https://github.com/o/r.git、ghpat wrap -- make deploy。
+
+7.5 cred-helper 模式（ghpat cred-helper）
+遵循 git credential helper 协议（man gitcredentials）。git 在需要凭据时以 argv[1] == "get" 调用本程序，通过 stdin 传入结构化键值对，程序将凭据写到 stdout。
+
+协议细节：
+1. argv 检查：argv[1] 必须为 get；store / erase 静默成功退出（exit 0，不落盘任何凭据）。
+2. stdin 解析：读取至空行，提取 protocol 与 host 字段（每行 key=value）。
+3. 域过滤：仅当 protocol == "https" 且 host ∈ {github.com, www.github.com} 时继续；否则输出空响应（换行）退出——不为其他 host 代理凭据。
+4. 取 PAT：经 IPC 向 daemon 发送 get_pat { host, protocol }，读取 {"username":"x-access-token","password":"<PAT>"}。
+5. stdout 输出：
+   username=x-access-token
+   password=<PAT>
+   （两行键值对 + 空行结束）
+6. 缓冲清理：IPC 响应缓冲（含 PAT 明文的 Vec<u8>/String）在写出后立即手动 zeroize，再退出进程。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. 安全规格
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8.1 socket 访问控制
+• bind 前 umask(0o077)，socket 创建即 0600，无 TOCTOU。
+• accept 后 getsockopt(SO_PEERCRED) 校验 uid == daemon uid，否则断开。
+• get_pat 无额外强化（v0.0.1）：同 UID 即可调用。审计日志记录每次 get_pat 的时间与调用方 PID。
+
+8.2 内存保护
+• 单页 mmap：daemon 启动时 mmap(MAP_PRIVATE|MAP_ANONYMOUS) 一页 4KiB，整页 mlock + madvise(MADV_DONTDUMP)；identity（32B）与 PatBuffer{len:u64, buf:[u8;256]} 原地存放。全生命周期一次 mlock、零次 munlock。
+• zeroize：更换 token 与退出时对页内区域 volatile 写零。
+• prctl(PR_SET_DUMPABLE, 0)：禁用 core dump，并阻止无 CAP_SYS_PTRACE 的同 UID 进程 ptrace 附加或读 /proc/<pid>/mem。
+• RLIMIT_MEMLOCK：单页 4KiB，默认 64KiB 限额内，无需 root。
+• 日志：仅错误与状态变更，1MB 截断，永不记录 PAT/密钥/token.enc 字节。
+• TLS：reqwest 默认 rustls，禁用 SSL_CERT_FILE 等环境变量干扰。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9. 错误码
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+code    场景      client 侧呈现 / daemon 行为
+DAEMON_NOT_RUNNING      connect 失败      ✘ daemon 未运行，请先执行 ghpat start
+SOCKET_STALE    文件存在但 connect 失败        自动清理后提示重试
+NO_TOKEN        ARMED 前调用 gh/get_pat    ✘ PAT 未注入，请执行 ghpat set-token
+DECRYPT_FAILED  age 解密失败        ✘ 解密失败：密文与公钥不匹配或已损坏；保留原状态
+TOKEN_INVALID   set-token 时 /user 返回 401        ✘ token 无效（401），注入被拒绝；保留原状态
+TOKEN_EXPIRED   运行中业务 API 返回 401        仅透传错误：✘ GitHub API 401: <message>；不自动清除内存中的 PAT。PAT 清除仅发生在：stop、set-token 成功替换、或人类显式确认失效后再次操作
+API_ERROR       GitHub API 非 2xx        透传 status + message
+NOT_RECIPIENT_FORMAT    age 密文为 passphrase 格式   ✘ 仅支持 age -r 公钥加密
+REMOTE_NOT_HTTPS        client 检测 SSH remote    ✘ ghpat 仅支持 HTTPS remote
+UID_MISMATCH    SO_PEERCRED 校验失败        daemon 静默断开
+START_TIMEOUT   父进程等管道 5s 超时    ✘ daemon 启动超时，exit(1)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+10. 依赖清单
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[package]
+name = "ghpat"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+
+[dependencies]
+age = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "signal", "process", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = { version = "1", features = ["zeroize_derive"] }   # 用于页外临时缓冲
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "1"
+libc = "0.2"                          # mmap/mlock/madvise/prctl/umask
+base64 = "0.22"
+dirs = "5"                            # XDG_RUNTIME_DIR 解析
+# --jq 支持：jaq 1.x 拆分为多个 crate
+jaq-core = "1"
+jaq-std = "1"
+jaq-json = "1"
+jaq-syn = "1"                         # jq 语法解析
+
+[profile.release]
+lto = "fat"
+strip = true
+panic = "unwind"                      # 保留 unwind 确保 Drop/zeroize 执行
+codegen-units = 1
+
+构建：cargo build --release --target x86_64-unknown-linux-musl
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+11. 测试规格
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+11.1 单元测试
+• SensitivePage：原地覆写正确性、zeroize 幂等、页内 PAT 长度边界（>256 报错）。
+• age 解密：合法 Recipients 密文、passphrase 拒绝、损坏密文、错公钥密文。
+• cred-helper：stdin 协议解析（get/store/erase）、host 过滤、stdout 格式、缓冲 zeroize 验证。
+• IPC 协议：JSON 帧序列化、错误响应格式。
+• gh 子命令：API mock 下的表格输出快照。
+• 指纹：ghp_/github_pat_/未知前缀三种格式。
+
+11.2 集成测试（真实二进制）
+1. 生命周期：start → 公钥格式合法（age1 + Bech32）→ status READY → set-token → status ARMED → stop → 进程与 socket 均不存在。
+2. fork 顺序回归：start 后立即（<100ms）执行 set-token，不出现 DAEMON_NOT_RUNNING（验证管道就绪同步）。
+3. token 更换：A → B → auth status 显示 B；broken.enc 注入失败后 auth status 仍显示 A 且 gh 命令可用。
+4. git push（标准 URL）：remote 为 https://github.com/o/r.git（无 user@），ghpat wrap -- git push 成功；检查 ~/.git-credentials、~/.config/gh/ 均不存在。
+5. wrap 无传染：ghpat wrap -- bash -c 'ghpat status' 正常输出状态（而非误入 cred-helper）。
+6. PAT 不进 argv：push 全程 strace -f -e trace=execve 抓取，PAT 明文不出现在任何 execve 的 argv。
+7. 多用户回退：清空 XDG_RUNTIME_DIR，两用户并发 start，socket 互不冲突。
+8. 信号：SIGTERM/SIGINT 后退出，socket 清理。
+9. 崩溃恢复：kill -9 → 残留 socket → 下次 start 自动清理。
+10. Fine-grained PAT：以 github_pat_ token 注入，auth status 显示 scopes: fine-grained。
+11. 401 不误杀：注入低权限 token，访问无权限端点（ghpat api /repos/private/repo）得 401 透传；随后 ghpat auth status 仍 ARMED、可用端点仍正常。
+
+11.3 验收标准
+• 单二进制 < 8MB（musl release）。
+• ghpat pr list 表格列定义与 gh pr list 一致（NUMBER/TITLE/BRANCH/STATE；golden file 对比列名与顺序，值格式允许差异）；--json 使用 §7.3 声明的 REST 映射字段集。
+• 内存副本口径：SensitivePage 内常驻 PAT 副本恒为 1；daemon 自身业务逻辑严禁克隆；cred-helper 的 IPC 响应缓冲发送后显式清零。第三方库内部瞬态堆拷贝为已知接受项。
+• §11.2 全部集成用例通过。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+12. 交付物
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+（v0.1+ 后续版本待办已拆分至 roadmap.txt，本版不实现。）
+1. ghpat 二进制（x86_64-musl，含 SHA256）。
+2. 本规格文档 v0.0.1。
+3. §11.2 集成测试脚本全集。
+4. ghpat --help 全量帮助文本。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+附录 A：典型操作时序
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+用户              client              daemon             GitHub
+ │ ghpat start     │                    │                   │
+ │────────────────>│ fork ─────────────>│ (子进程) umask     │
+ │                 │                    │  tokio init       │
+ │                 │                    │  mmap+mlock页     │
+ │                 │                    │  生成identity     │
+ │                 │                    │  bind+listen      │
+ │<──公钥(管道)────│<──OK age1...──────│                   │
+ │                 │ exit(0)            │ 进入事件循环      │
+ │                 │                    │                   │
+ │ (人类: age -r <公钥> -o token.enc pat.txt)                │
+ │                 │                    │                   │
+ │ ghpat set-token │                    │                   │
+ │────────────────>│ 读文件→base64      │                   │
+ │                 │──set_token────────>│ age解密(临时缓冲  │
+ │                 │                    │  写入SensitivePage│
+ │                 │                    │  后即zeroize)     │
+ │                 │                    │──GET /user───────>│
+ │                 │                    │<──200 octocat─────│
+ │<──ARMED─────────│<──ok──────────────│                   │
+ │                 │                    │                   │
+ │ ghpat pr list   │                    │                   │
+ │────────────────>│──gh[pr,list]──────>│ GET /pulls (Bearer)│
+ │                 │                    │<──json────────────│
+ │<──表格──────────│<──stdout──────────│                   │
+ │                 │                    │                   │
+ │ ghpat wrap -- git push origin main   │                   │
+ │────────────────>│ fork git + 注入    │                   │
+ │                 │  GIT_CONFIG_COUNT=1                   │
+ │                 │  GIT_CONFIG_KEY_0=credential.           │
+ │                 │    https://github.com.helper           │
+ │                 │  GIT_CONFIG_VALUE_0=!ghpat cred-helper │
+ │                 │        ┌───────────┤                   │
+ │                 │        │cred-helper │                   │
+ │                 │        │ argv[1]=get│                   │
+ │                 │        │ stdin:     │                   │
+ │                 │        │  protocol=https                │
+ │                 │        │  host=github.com               │
+ │                 │        │──get_pat──>│                   │
+ │                 │        │<─user/pass─│                   │
+ │                 │        │ stdout:    │                   │
+ │                 │        │  username=x-access-token       │
+ │                 │        │  password=<PAT>                │
+ │                 │        │ 缓冲zeroize│                   │
+ │                 │        └───────────┤                   │
+ │                 │ git 单次get完成 ──────────────────────>│
+ │<──push结果──────│<──透传─────────────│                   │
+ │                 │                    │                   │
+ │ ghpat stop      │                    │                   │
+ │────────────────>│──shutdown─────────>│ zeroize 整页      │
+ │                 │                    │ unlink socket     │
+ │<──已销毁────────│<──ok──────────────│ exit              │

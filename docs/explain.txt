@@ -1,0 +1,105 @@
+ghpat 规格文档 v0.0.1 —— 解释性内容汇编
+（自规格文档拆分，含各节解释、机制说明与技术依据；正文规格不在本文件内）
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+一、v0.0.1 修订摘要（变更解释）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+优先级     位置      变更
+P0      §4.1 / §7.4 / §7.5      废弃 GHPAT_CRED_HELPER=1 环境变量分叉与 GIT_ASKPASS 正则解析，改为显式子命令 ghpat cred-helper，通过 GIT_CONFIG_COUNT 注入 credential.https://github.com.helper，彻底消除环境变量传染与两次询问/argv 泄漏问题
+P0      §5.3 / §7.2     修正 daemon 启动顺序：先 fork（--daemon-internal），子进程内再初始化 Tokio、生成密钥、mlock、bind，通过匿名管道向父进程回传公钥与就绪信号，规避 mlock 跨 fork 失效与运行时死锁
+P1      §5.1 / §8.2     敏感数据改为单页 mmap + mlock + MADV_DONTDUMP + 定长字节数组，规避普通堆分配的同页误解锁陷阱
+P1      §5.2 / §7.2 / §9        set-token 解密/验证失败时保留原有效 PAT（ARMED 不回退）；运行时业务 401 仅透传错误、不自动销毁 PAT
+P1      §6.1 / §5.3     socket 回退路径改为 /tmp/ghpat-$UID/ghpat.sock；bind 前设 umask(0o077) 消除 TOCTOU；校验父目录归属
+P1      §3.3 / §8.2     威胁模型与 PR_SET_DUMPABLE=0 对齐：明示同 UID 非特权进程的 ptrace 已被防御；同 UID 主动窃取 PAT（含被注入的 Agent 直接调用 cred-helper）明示为 v0.0.x 不在防御范围，缓解方案列为 v0.1+ 待办
+P2      §7.2 / §7.3 / §11.3     兼容 Fine-grained PAT（无 X-OAuth-Scopes）；指纹改为 <prefix>…<末4位>；--json 明示使用 REST 原生字段（与 gh 的 GraphQL 字段不同），验收从"逐字段一致"降为"表格列对齐"
+P2      §10 / §11.3 / §7.2      补全 jaq 依赖；"内存副本恒为 1"改为务实表述；日志加 1MB 截断上限
+—       全局      版本号 v1.0-draft → v0.0.1；Panic 策略、验收标准同步收敛到最小可发布集合
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+二、§3.3 威胁模型定位说明
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【v0.0.1 修订：与 §8.2 的 PR_SET_DUMPABLE 对齐，并明确定位 Agent 防御目标】
+
+关键解释：恶意/被注入的 Agent 与 client 同 UID、同二进制路径，cred-helper 协议层面无法区分善意与恶意调用方。本工具在 Agent 场景的定位是防止无意泄露（Agent 误读盘、误打印 env、误 cat ~/.git-credentials），而非对抗主动窃取。主动窃取的缓解方案（一次性 ticket、--gh-only 模式）列为 v0.1+ 待办。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+三、§5.1 SensitivePage 安全性解释
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+/// 安全前提：全页 mlock 一次、永不 munlock，规避普通堆分配器
+/// 将 identity 与 pat 落在同一页导致的"munlock 同页误解锁"陷阱，
+/// 也规避 Zeroizing<String> realloc 引起的锁失效。
+
+规则解释：daemon 自身业务代码严禁将 PAT 复制到 SensitivePage 之外的任何缓冲；reqwest/serde_json 等第三方库内部的临时拷贝无法 zeroize，属已知接受项（见 §11.3 务实验收口径）。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+四、§5.2 生命周期状态机变更说明
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+变更说明：v0.0.1 起，set-token 解密或验证失败不再销毁已有旧 token——一次手误（错文件/错公钥）不应导致正在工作的会话瘫痪，需要人类重新加密注入。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+五、§5.3 启动流程核心原则
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+核心原则：mlock 不跨 fork 继承，且 Tokio 多线程运行时启动后不可再 fork。因此密钥生成、mlock、Tokio 初始化必须全部发生在 fork 之后的子进程内。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+六、§7.4 wrap 模式 GIT_CONFIG_COUNT 注入机制说明
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+机制说明：GIT_CONFIG_COUNT + GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n 是 Git 原生的环境变量配置注入机制，优先级高于所有配置文件。credential.https://github.com.helper 仅对 github.com 的 HTTPS 凭据请求生效，不污染其他 host 的既有 helper 链。! 前缀表示按 shell 命令执行（单条命令，无 shell 元字符注入风险，路径为绝对路径）。
+
+相比 v1.0-draft 的改进：
+1. 无环境变量传染：GHPAT_CRED_HELPER=1 已废弃，wrap 环境内任何 ghpat pr view、ghpat api ... 命令正常走 client 模式，不会误入 helper 分叉。
+2. 无两次询问陷阱：走标准 credential helper 协议而非 GIT_ASKPASS，git 单次 get 调用即完成取凭据，不存在"先问 Username 再问 Password"导致的正则解析失败或 PAT 被拼入 argv 的风险。
+3. stdin/stdout/stderr 直通子进程，退出码透传。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+七、§7.5 cred-helper 已接受的暴露窗口与提权面说明
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+已接受的暴露窗口（明示）：PAT 明文短暂存在于 cred-helper 进程内存与 stdout 管道（接收方为该次 git 子进程）。此为 credential helper 协议固有形态。
+
+提权面（明示，见 §3.3）：同 UID 的任意进程（含 AI Agent）可直接运行：
+printf 'protocol=https\nhost=github.com\n\n' | ghpat cred-helper
+从而获取 PAT。v0.0.1 不防御此场景；v0.1+ 待办的缓解方案见 §12.1。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+八、§7.3 --json 字段口径说明
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+--json <fields>：v0.0.1 直接映射 REST API 原生字段（number、title、state、head.ref→headRefName 等核心字段集：number,title,state,headRefName,baseRefName,url,author,createdAt,isDraft）。注意：官方 gh 的 --json 基于 GraphQL，字段名与嵌套结构与 REST 不同；ghpat v0.0.1 不承诺与 gh 的 --json 输出逐字段一致，GraphQL 对齐列为 v0.1+ 待办。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+九、§8.2 PR_SET_DUMPABLE=0 的双重作用
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+prctl(PR_SET_DUMPABLE, 0)：同时达成两件事——core dump 禁用，以及阻止无 CAP_SYS_PTRACE 的同 UID 进程 ptrace 附加或读 /proc/<pid>/mem（此为 §3.3 已防御项）。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+十、§11.3 务实验收口径解释
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+• ghpat pr list 表格列定义与 gh pr list 一致（NUMBER/TITLE/BRANCH/STATE；golden file 对比列名与顺序，值格式允许差异）；--json 使用 §7.3 声明的 REST 映射字段集，不承诺与 gh 的 GraphQL --json 逐字段一致。
+• 内存副本口径（务实）：SensitivePage 内常驻 PAT 副本恒为 1；daemon 自身业务逻辑严禁克隆；cred-helper 的 IPC 响应缓冲发送后显式清零。reqwest/serde_json/hyper/rustls 内部的瞬态堆拷贝无法 zeroize，属已知接受项。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+十一、附录 B：与 gh CLI 的行为差异（明示用户）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+差异点     gh      ghpat v0.0.1    原因
+认证来源    keyring/hosts.yml       内存      核心设计
+SSH remote      支持      不支持     PAT 仅适用 HTTPS
+--json 字段名      GraphQL 命名（headRefName 等）       REST 原生/核心映射集（§7.3）     v0.0.1 基于 REST；GraphQL 对齐为 v0.1+
+pr list 列表缺 reviewDecision 等    有       无（REST 列表接口不返回） 同上
+Fine-grained PAT scopes 显示      细粒度权限列表 fine-grained    /user 无 X-OAuth-Scopes
+token 失效自动登出    401 即清除 401 透传、不自动清除    防瞬态/局部 401 误杀会话（§9）
+set-token 失败影响当前会话      —       不影响（保留旧 token）  §5.2
+扩展命令    全量      §7.3 所列 + api 透传        渐进实现
+别名系统    支持      不支持     低优先级
+同 UID Agent 主动窃取 PAT    —       不防御（§3.3）       v0.1+ 待办（§12.1）
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+十二、附录 C：v0.0.1 关键决策的技术依据
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+决策      依据
+GIT_CONFIG_COUNT 注入替代 GHPAT_CRED_HELPER env 分叉  Git 原生环境配置机制，优先级高于配置文件，避免环境变量在嵌套脚本中传染导致所有 ghpat 命令误入 helper 模式
+credential helper 协议替代 GIT_ASKPASS 正则   GIT_ASKPASS 对无 user@ 的标准 HTTPS URL 触发两次询问（先 Username 后 Password），且 PAT 可能被拼入第二次 argv；credential helper 走 stdin 结构化协议，单次 get 完成
+fork 后子进程内生成密钥/mlock/tokio      mlock 建立的锁不被 fork 出的子进程继承；Tokio rt-multi-thread 启动后 fork 会破坏 epoll fd 状态导致死锁。管道回传公钥同时解决就绪竞态
+单页 mmap 替代堆上 Zeroizing<String>  mlock/munlock 按 4KiB 页生效且同页多次 mlock 无引用计数，堆上小对象极大概率同页，换 token 的 munlock 会误伤同页其他锁
+回退路径含 UID + umask       /tmp sticky-bit 下他人可抢注 /tmp/ghpat.sock 造成 unlink EPERM DoS；umask(0o077) 消除 bind→chmod 的 TOCTOU 窗口
+PR_SET_DUMPABLE=0       同时禁 core dump 并阻止无 CAP_SYS_PTRACE 的同 UID 进程 ptrace 附加——比原威胁模型声明更强，故 §3.3 已更新
+401 不自动清除 PAT   Fine-grained PAT 对特定资源返回 401 属常态；瞬态 401 亦存在；自动销毁会导致必须人工重新加密注入
+解密失败保留旧 token   热更新手误不应中断正在服务的会话；失败路径零副作用
