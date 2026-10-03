@@ -74,10 +74,25 @@ socket 路径：`${XDG_RUNTIME_DIR:-/tmp/ghpat-$UID}/ghpat.sock`（目录自动�
 - wrap：GIT_CONFIG_COUNT/KEY_0/VALUE_0/GIT_TERMINAL_PROMPT=0/GHPAT_SOCK 注入、退出码透传
 - 崩溃恢复：kill -9 后残留 socket 检测、自动清理重启、目录权限 0700
 
+## 真网验证记录（2026-10-03）
+
+使用真实 fine-grained PAT（经 age 加密注入）完成端到端真网验证：
+
+| 能力 | 命令 | 结果 |
+|---|---|---|
+| 注入校验 | `set-token token.enc` | ✔ age 解密 → `/user` 200 → ARMED，指纹 `github_pat_…RJBE` |
+| 认证查询 | `auth status` | ✔ 已认证为 entropy356 |
+| 仓库读取 | `repo list` / `repo view` | ✔ 字段映射正确；缺参数时报错并 exit≠0 |
+| API 透传 | `api /repos/... --jq` | ✔ contents/commits 查询正常 |
+| PR/Issue 读取 | `pr list` / `issue list` / `pr view 999` | ✔ 空列表正常；404 正确透传 exit=1 |
+| **写路径** | `issue create` | ✔ 成功创建 [Issue #1](https://github.com/entropy356/ai-workspace/issues/1) 并用后关闭 |
+| **cred-helper** | `wrap -- git clone/push` | ✔ 真网 clone + push 本仓库，全程 PAT 不出现在进程参数 |
+
 ## 已知限制（如实说明）
 
-1. **GitHub API 200 路径未做真网验证**（沙箱无真实 PAT）。`/user` 校验、401/非 200
-   错误分支、列表分页聚合、字段映射等逻辑已按规格实现并经代码审查；401 拒绝注入路径已测。
+1. **GitHub API 401/非 200 错误分支的真网复测**：200 路径已全量真网验证（见上表），
+   401 拒绝注入路径已在沙箱实测（错误密文/无效凭据注入被拒且保留 READY），但
+   "已注入 token 中途失效后的 401 响应分支"未真网复测。
 2. **崩溃恢复的多用户并发测试**（规格 §11.2-7）需两个真实 UID 的环境，沙箱为单用户，
    以"kill -9 + 残留 socket 清理重启"用例覆盖了同等逻辑。
 3. **daemon 启动时无父进程校验**：`--daemon-internal` 理论上可被同 UID 进程直接调用
@@ -88,7 +103,18 @@ socket 路径：`${XDG_RUNTIME_DIR:-/tmp/ghpat-$UID}/ghpat.sock`（目录自动�
 5. release 构建使用 `lto="thin"`（规格建议 fat，沙箱 2 核 + 网络文件系统无法承受 fat
    链接；产物 5.87MB 仍满足 <8MB 验收）。
 
-## 源码
+## 源码与构建
 
-完整 Rust 工程位于会话工作区 `ghpat/`（Cargo.toml 依赖与规格 §10 一致，另加 bech32 0.9
-用于 age 密钥原始字节与页缓冲的互转）。
+完整 Rust 工程位于本仓库 [`ghpat/`](../ghpat/) 目录（11 个模块，约 2500 行）：
+
+```bash
+cd ghpat
+cargo build --release        # 或 cross build --release --target x86_64-unknown-linux-musl
+cargo test
+bash ../ghpat-v0.0.1/run_tests.sh ./target/release/ghpat
+```
+
+- 模块划分：`page.rs`（mlock 敏感页）/ `agekey.rs`（age 密钥与加解密）/ `daemon.rs`（IPC 与
+  生命周期）/ `client.rs` / `gh.rs`（gh 等价命令与 REST）/ `cred.rs` + `wrap.rs`（cred-helper
+  与 wrap）/ `jq.rs` / `ipc.rs` / `err.rs` / `main.rs`（形态分叉）
+- Cargo.toml 依赖与规格 §10 一致，另加 bech32 0.9 用于 age 密钥原始字节与页缓冲的互转
